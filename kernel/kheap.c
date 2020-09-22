@@ -69,7 +69,7 @@ void k_heap_free(struct k_heap *h, void *mem)
  * backend.
  */
 
-int k_mem_pool_alloc(struct k_mem_pool *p, struct k_mem_block *block,
+int z_mem_pool_alloc(struct k_mem_pool *p, struct k_mem_block *block,
 		     size_t size, k_timeout_t timeout)
 {
 	block->id.heap = p->heap;
@@ -85,7 +85,7 @@ int k_mem_pool_alloc(struct k_mem_pool *p, struct k_mem_block *block,
 	}
 }
 
-void k_mem_pool_free_id(struct k_mem_block_id *id)
+void z_mem_pool_free_id(struct k_mem_block_id *id)
 {
 	k_heap_free(id->heap, id->data);
 }
