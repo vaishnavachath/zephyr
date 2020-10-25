@@ -479,3 +479,29 @@ void test_posix_pthread_termination(void)
 	ret = pthread_getschedparam(newthread[N_THR_T/2], &policy, &schedparam);
 	zassert_equal(ret, ESRCH, "got attr from terminated thread!");
 }
+
+#ifdef CONFIG_PTHREAD_DYNAMIC_STACK
+static void *fun(void *arg)
+{
+	*((uint32_t *)arg) = 0xB105F00D;
+	return NULL;
+}
+
+void test_posix_thread_attr_stacksize(void)
+{
+	uint32_t x = 0;
+	pthread_attr_t attr;
+	pthread_t th;
+
+	/* TESTPOINT: specify a custom stack size via pthread_attr_t */
+	zassert_equal(0, pthread_attr_init(&attr), "");
+	zassert_equal(0, pthread_attr_setstacksize(&attr, 256), "");
+	zassert_equal(0, pthread_create(&th, &attr, fun, &x), "");
+	zassert_equal(0, pthread_join(th, NULL), "");
+	zassert_equal(0xB105F00D, x, "");
+}
+#else
+void test_posix_thread_attr_stacksize(void)
+{
+}
+#endif
