@@ -13,7 +13,7 @@ void z_mem_pool_free(struct k_mem_block *block)
 	z_mem_pool_free_id(&block->id);
 }
 
-void *z_heap_malloc(struct k_heap *heap, size_t size)
+void *z_heap_aligned_alloc(struct k_heap *heap, size_t align, size_t size)
 {
 	/*
 	 * get a block large enough to hold an initial (hidden) heap
@@ -24,7 +24,7 @@ void *z_heap_malloc(struct k_heap *heap, size_t size)
 		return NULL;
 	}
 
-	struct k_heap **blk = k_heap_alloc(heap, size, K_NO_WAIT);
+	struct k_heap **blk = k_heap_aligned_alloc(heap, align, size, K_NO_WAIT);
 
 	if (blk == NULL) {
 		return NULL;
@@ -35,6 +35,11 @@ void *z_heap_malloc(struct k_heap *heap, size_t size)
 	/* return address of the user area part of the block to the caller */
 	return (char *)&blk[1];
 
+}
+
+void *z_heap_malloc(struct k_heap *heap, size_t size)
+{
+	return z_heap_aligned_alloc(heap, sizeof(void *), size);
 }
 
 void *z_mem_pool_malloc(struct k_mem_pool *pool, size_t size)
@@ -57,9 +62,29 @@ void k_free(void *ptr)
 K_HEAP_DEFINE(_system_heap, CONFIG_HEAP_MEM_POOL_SIZE);
 #define _SYSTEM_HEAP (&_system_heap)
 
-void *k_malloc(size_t size)
+void *k_aligned_alloc(size_t align, size_t size)
 {
-	return z_heap_malloc(_SYSTEM_HEAP, size);
+	/* align must be a power of two */
+	if (popcount(align) != 1) {
+		return NULL;
+	}
+
+	/* align must be multiple of sizeof(void *) */
+	if (align < sizeof(void *)) {
+		return NULL;
+	}
+
+	/* align must be multiple of sizeof(void *) */
+	if ((align % sizeof(void *)) != 0) {
+		return NULL;
+	}
+
+	/* size must be an integral multiple of align */
+	if ((size % align) != 0) {
+		return NULL;
+	}
+
+	return z_heap_aligned_alloc(_SYSTEM_HEAP, align, size);
 }
 
 void *k_calloc(size_t nmemb, size_t size)
