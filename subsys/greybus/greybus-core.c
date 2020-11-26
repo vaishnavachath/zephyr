@@ -621,14 +621,9 @@ int _gb_register_driver(unsigned int cport, int bundle_id,
     if (retval)
         goto pthread_attr_init_error;
 
-#if 0
     retval = pthread_attr_setstacksize(&thread_attr, driver->stack_size);
     if (retval)
         goto pthread_attr_setstacksize_error;
-#else
-    void *stack = malloc(driver->stack_size);
-	(void)pthread_attr_setstack(&thread_attr, stack, driver->stack_size);
-#endif
 
     retval = pthread_create(&g_cport[cport].thread, &thread_attr,
                             gb_pending_message_worker, (void *)((intptr_t) cport));
@@ -643,7 +638,7 @@ int _gb_register_driver(unsigned int cport, int bundle_id,
     return 0;
 
 pthread_create_error:
-//pthread_attr_setstacksize_error:
+pthread_attr_setstacksize_error:
     if (thread_attr_ptr != NULL)
         pthread_attr_destroy(&thread_attr);
 pthread_attr_init_error:
