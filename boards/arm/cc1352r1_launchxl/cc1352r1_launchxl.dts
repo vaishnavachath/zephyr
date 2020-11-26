@@ -15,6 +15,8 @@
  */
 #define IOC_PORT_MCU_UART0_TX 0x00000010
 #define IOC_PORT_MCU_UART0_RX 0x0000000F
+#define IOC_PORT_MCU_UART1_TX 0x00000014
+#define IOC_PORT_MCU_UART1_RX 0x00000013
 
 #define BTN_GPIO_FLAGS (GPIO_ACTIVE_LOW | GPIO_PULL_UP)
 
@@ -32,8 +34,8 @@
 	chosen {
 		zephyr,sram = &sram0;
 		zephyr,flash = &flash0;
-		zephyr,console = &uart0;
-		zephyr,shell-uart = &uart0;
+		zephyr,console = &uart1;
+		zephyr,shell-uart = &uart1;
 	};
 
 	leds {
@@ -78,6 +80,13 @@
 	current-speed = <115200>;
 	tx-pin = <13 IOC_PORT_MCU_UART0_TX>;
 	rx-pin = <12 IOC_PORT_MCU_UART0_RX>;
+};
+
+&uart1 {
+    status = "okay";
+    current-speed = <115200>;
+    tx-pin = <24 IOC_PORT_MCU_UART1_TX>;
+    rx-pin = <22 IOC_PORT_MCU_UART1_RX>;
 };
 
 &i2c0 {

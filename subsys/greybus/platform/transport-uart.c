@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/byteorder.h>
+#include <sys/ring_buffer.h>
 #include <zephyr.h>
 
 #include "transport.h"
@@ -16,163 +17,77 @@ LOG_MODULE_REGISTER(greybus_transport_uart, LOG_LEVEL_DBG);
 /* Based on UniPro, from Linux */
 #define CPORT_ID_MAX 4095
 
-static int getMessage(struct device *dev, struct gb_operation_hdr **msg);
 static int sendMessage(struct device *dev, struct gb_operation_hdr *msg);
+static void uart_work_fn(struct k_work *work);
 
 static struct device *uart_dev;
-static pthread_t receive_thread;
 
-K_PIPE_DEFINE(gb_xport_uart_pipe, 64, 1);
+RING_BUF_DECLARE(uart_rb, GB_MTU);
+static K_WORK_DEFINE(uart_work, uart_work_fn);
 
-static void *thread_fun(void *arg)
+static void uart_work_fn(struct k_work *work)
 {
-	int r;
-	int i = 0;
-	struct gb_operation_hdr *msg = NULL;
-    unsigned int cport = -1;
-
-	for (;;) {
-		r = getMessage(uart_dev, &msg);
-		if (r < 0) {
-			LOG_DBG("failed to receive message (%d)", r);
-			break;
-		}
-
-		LOG_HEXDUMP_DBG(msg, sys_le16_to_cpu(msg->size), "RX:");
-
-		cport = sys_le16_to_cpu(*((uint16_t *)msg->pad));
-
-		r = greybus_rx_handler(cport, msg, sys_le16_to_cpu(msg->size));
-		if (r < 0) {
-			LOG_DBG("failed to handle message %u: size: %u, id: %u, type: %u",
-				i, sys_le16_to_cpu(msg->size), sys_le16_to_cpu(msg->id),
-				msg->type);
-		}
-	}
-
-	return NULL;
-}
-
-static int uart_rx(const struct device *dev, uint8_t *buf, size_t len, int32_t timeout)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(timeout);
-	size_t nread;
-
-	for( ;len > 0; ) {
-		int r = k_pipe_get(&gb_xport_uart_pipe, buf, len, &nread, len, K_FOREVER);
-		if (r < 0) {
-			LOG_ERR("k_pipe_get() returned %d", r);
-			continue;
-		}
-		buf += nread;
-		len -= nread;
-	}
-
-	return 0;
-}
-
-static int getMessage(struct device *dev, struct gb_operation_hdr **msg)
-{
-	int r;
-	void *tmp;
+	struct gb_operation_hdr *msg;
+	uint8_t *data;
+	size_t len;
 	size_t msg_size;
 	size_t payload_size;
-	size_t remaining;
-	size_t offset;
-	size_t recvd;
+	unsigned int cport = -1;
+	int r;
 
-	if (NULL == msg) {
-		LOG_DBG("One or more arguments were NULL or invalid");
-		r = -EINVAL;
-		goto out;
+	len = ring_buf_get_claim(&uart_rb, &data, GB_MTU);
+	if (!len) {
+		LOG_DBG("ringbuf empty!");
+		return;
 	}
 
-	tmp = realloc(*msg, sizeof(**msg));
-	if (NULL == tmp) {
-		LOG_DBG("Failed to allocate memory");
-		r = -ENOMEM;
-		goto out;
-	}
-	*msg = tmp;
+	if (len < sizeof(struct gb_operation_hdr))
+		goto err_out;
 
-read_header:
-	for (remaining = sizeof(**msg), offset = 0, recvd = 0; remaining;
-	     remaining -= recvd, offset += recvd, recvd = 0) {
+	msg = (struct gb_operation_hdr *) data;
 
-		r = uart_rx(dev, &((uint8_t *)*msg)[offset], remaining, SYS_FOREVER_MS);
-		if (r < 0) {
-			LOG_DBG("uart_rx failed (%d)", r);
-			k_usleep(100);
-			continue;
-		}
-		recvd = remaining;
-	}
-
-	msg_size = sys_le16_to_cpu((*msg)->size);
+	msg_size = sys_le16_to_cpu(msg->size);
 	if (msg_size < sizeof(struct gb_operation_hdr)) {
 		LOG_DBG("invalid message size %u", (unsigned)msg_size);
-		goto read_header;
+		goto err_out;
 	}
 
-	payload_size = msg_size - sizeof(**msg);
+	if (len < msg_size)
+		goto err_out;
+
+	payload_size = msg_size - sizeof(struct gb_operation_hdr);
 	if (payload_size > GB_MAX_PAYLOAD_SIZE) {
 		LOG_DBG("invalid payload size %u", (unsigned)payload_size);
-		goto read_header;
+		goto err_out;
 	}
 
-	if (payload_size > 0) {
-		tmp = realloc(*msg, msg_size);
-		if (NULL == tmp) {
-			LOG_DBG("Failed to allocate memory");
-			r = -ENOMEM;
-			goto freemsg;
-		}
-		*msg = tmp;
+	LOG_HEXDUMP_DBG(msg, msg_size, "RX:");
+	cport = sys_le16_to_cpu(*((uint16_t *)msg->pad));
 
-		for (remaining = payload_size, offset = sizeof(**msg),
-		    recvd = 0;
-		     remaining;
-		     remaining -= recvd, offset += recvd, recvd = 0) {
-
-			r = uart_rx(dev, &((uint8_t *)*msg)[offset], remaining, SYS_FOREVER_MS);
-			if (r < 0) {
-				LOG_DBG("uart_rx failed (%d)", r);
-				k_usleep(100);
-				continue;
-			}
-			recvd = remaining;
-		}
+	r = greybus_rx_handler(cport, msg, sys_le16_to_cpu(msg->size));
+	if (r < 0) {
+		LOG_DBG("failed to handle message : size: %u, id: %u, type: %u",
+		sys_le16_to_cpu(msg->size), sys_le16_to_cpu(msg->id),
+		msg->type);
 	}
+	ring_buf_get_finish(&uart_rb, msg_size);
 
-	r = msg_size;
-	goto out;
+err_out:
+	ring_buf_get_finish(&uart_rb, 0);
+	return;
 
-freemsg:
-	free(*msg);
-	*msg = NULL;
-
-out:
-	return r;
 }
 
 static int sendMessage(struct device *dev, struct gb_operation_hdr *msg)
 {
-	int r;
-	size_t offset;
+	size_t offset = 0;
 	size_t remaining;
-	size_t written;
 
-	for (remaining = sys_le16_to_cpu(msg->size), offset = 0, written = 0;
-	     remaining; remaining -= written, offset += written, written = 0) {
-
-		uart_poll_out(dev, &((uint8_t *)msg)[offset]);
-		written = 1;
+	for (remaining = sys_le16_to_cpu(msg->size); remaining; remaining -= 1, offset += 1) {
+		uart_poll_out(dev, ((uint8_t *)msg)[offset]);
 	}
 
-	r = 0;
-
-	return r;
+	return remaining;
 }
 
 static void gb_xport_init(void)
@@ -192,9 +107,7 @@ static int gb_xport_stop_listening(unsigned int cport)
 static int gb_xport_send(unsigned int cport, const void *buf, size_t len)
 {
 	int r;
-    uint16_t *cportp;
 	struct gb_operation_hdr *msg;
-	struct gb_transport_tcpip_context *ctx;
 
 	msg = (struct gb_operation_hdr *)buf;
     if (NULL == msg) {
@@ -241,8 +154,8 @@ static void gb_xport_uart_isr(const struct device *dev, void *user_data)
 	int r;
 	uint8_t byte;
 	uint8_t ovflw;
-	size_t count = 0;
-	size_t nwritten;
+	uint8_t *data;
+	size_t count;
 
 	while (uart_irq_update(dev) &&
 	       uart_irq_is_pending(dev)) {
@@ -258,11 +171,26 @@ static void gb_xport_uart_isr(const struct device *dev, void *user_data)
 			return;
 		}
 
-		if (0 != k_pipe_put(&gb_xport_uart_pipe, &byte, 1, &nwritten, 1, K_NO_WAIT)) {
-			LOG_ERR("k_pipe_put() failed");
+		if (0 == ring_buf_space_get(&uart_rb)) {
+			r = ring_buf_get(&uart_rb, &ovflw, 1);
+			if (r != 1) {
+				LOG_ERR("failed to remove head of ring buffer");
+				uart_irq_rx_disable(dev);
+				return;
+			}
+			LOG_ERR("overflow occurred");
+		}
+
+		if (1 != ring_buf_put(&uart_rb, &byte, 1)) {
+			LOG_ERR("ring_buf_put() failed");
 			uart_irq_rx_disable(dev);
 			return;
 		}
+	}
+	count = ring_buf_get_claim(&uart_rb, &data, GB_MTU);
+	ring_buf_get_finish(&uart_rb, 0);
+	if (count >= sizeof(struct gb_operation_hdr)) {
+		k_work_submit(&uart_work);
 	}
 }
 
@@ -313,12 +241,6 @@ struct gb_transport_backend *gb_transport_backend_init(unsigned int *cports, siz
     if (r < 0) {
     	goto out;
     }
-
-	r = pthread_create(&receive_thread, NULL, thread_fun, NULL);
-	if (r != 0) {
-		LOG_ERR("pthread_create: %d", r);
-		goto out;
-	}
 
     ret = (struct gb_transport_backend *)&gb_xport;
 
