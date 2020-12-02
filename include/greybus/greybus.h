@@ -72,19 +72,6 @@ typedef void (*gb_operation_callback)(struct gb_operation *operation);
 typedef uint8_t (*gb_operation_handler_t)(struct gb_operation *operation);
 typedef void (*gb_operation_fast_handler_t)(unsigned int cport, void *data);
 
-#if !defined(CONFIG_GREYBUS_DEBUG)
-#define GB_HANDLER(t, h) \
-    { \
-        .type = t, \
-        .handler = h, \
-    }
-
-#define GB_FAST_HANDLER(t, h) \
-    { \
-        .type = t, \
-        .fast_handler = h, \
-    }
-#else
 #define GB_HANDLER(t, h) \
     { \
         .type = t, \
@@ -98,15 +85,12 @@ typedef void (*gb_operation_fast_handler_t)(unsigned int cport, void *data);
         .fast_handler = h, \
         .name = #h, \
     }
-#endif
 
 struct gb_operation_handler {
     uint8_t type;
     gb_operation_handler_t handler;
     gb_operation_fast_handler_t fast_handler;
-#ifdef CONFIG_GREYBUS_DEBUG
     const char *name;
-#endif
 };
 
 struct gb_transport_backend {
@@ -228,11 +212,7 @@ static inline const char *gb_driver_name(struct gb_driver *driver)
 
 static inline const char *gb_handler_name(struct gb_operation_handler *handler)
 {
-#ifdef CONFIG_GREYBUS_DEBUG
     return handler->name;
-#else
-    return "unknown";
-#endif
 }
 
 int gb_init(struct gb_transport_backend *transport);

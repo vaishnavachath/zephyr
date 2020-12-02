@@ -170,8 +170,7 @@ int pthread_create(pthread_t *newthread, const pthread_attr_t *attr,
 			}
 
 			dynamic_stack = k_aligned_alloc(ARCH_STACK_PTR_ALIGN,
-				Z_KERNEL_STACK_SIZE_ADJUST(
-                                mattr->stacksize));
+				Z_KERNEL_STACK_SIZE_ADJUST(mattr->stacksize));
 			if (dynamic_stack == NULL) {
 				return EAGAIN;
 			}
@@ -397,7 +396,7 @@ static void zephyr_pthread_stack_reclaim(struct k_thread *thread)
 	p -= thread->stack_info.delta;
 	memset((void *)thread->stack_info.start, 0,
 		thread->stack_info.size);
-	free(p);
+	k_free(p);
 }
 #else
 static inline void zephyr_pthread_stack_reclaim(struct k_thread *thread)

@@ -30,8 +30,8 @@
  * Author: Christopher Friedt <chrisfriedt@gmail.com>
  */
 
+#include <logging/log.h>
 #include <drivers/gpio.h>
-#include <greybus/debug.h>
 #include <greybus/greybus.h>
 #include <greybus/platform.h>
 #include <sys/byteorder.h>
@@ -45,6 +45,8 @@
 #endif
 
 #include "gpio-gb.h"
+
+LOG_MODULE_REGISTER(greybus_gpio, LOG_LEVEL_INF);
 
 #define GB_GPIO_VERSION_MAJOR 0
 #define GB_GPIO_VERSION_MINOR 1
@@ -106,7 +108,7 @@ static uint8_t gb_gpio_activate(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -134,7 +136,7 @@ static uint8_t gb_gpio_deactivate(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -163,7 +165,7 @@ static uint8_t gb_gpio_get_direction(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -196,7 +198,7 @@ static uint8_t gb_gpio_direction_in(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -223,7 +225,7 @@ static uint8_t gb_gpio_direction_out(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -260,7 +262,7 @@ static uint8_t gb_gpio_get_value(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -291,7 +293,7 @@ static uint8_t gb_gpio_set_value(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -317,7 +319,7 @@ static uint8_t gb_gpio_set_debounce(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -347,7 +349,7 @@ static uint8_t gb_gpio_irq_mask(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -373,7 +375,7 @@ static uint8_t gb_gpio_irq_unmask(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 
@@ -431,7 +433,7 @@ static uint8_t gb_gpio_irq_type(struct gb_operation *operation)
 	__ASSERT_NO_MSG(cfg != NULL);
 
 	if (gb_operation_get_request_payload_size(operation) < sizeof(*request)) {
-		gb_error("dropping short message\n");
+		LOG_ERR("dropping short message");
 		return GB_OP_INVALID;
 	}
 

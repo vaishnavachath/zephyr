@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <zephyr.h>
+#include <sys/dlist.h>
 
 #if defined(CONFIG_BOARD_NATIVE_POSIX_64BIT) \
     || defined(CONFIG_BOARD_NATIVE_POSIX_32BIT) \
@@ -55,173 +56,225 @@ LOG_MODULE_REGISTER(greybus_transport_tcpip);
 #define CPORT_ID_MAX 4095
 
 #define GB_TRANSPORT_TCPIP_BASE_PORT 4242
-#define GB_TRANSPORT_TCPIP_BACKLOG 1
+#define GB_TRANSPORT_TCPIP_BACKLOG 0
+
+enum fd_context_type {
+	FD_CONTEXT_SERVER = 1,
+	FD_CONTEXT_CLIENT = 2,
+	FD_CONTEXT_ANY = 3,
+};
+
+struct fd_context {
+	sys_dnode_t node;
+    int fd;
+    int cport;
+    bool listen;
+    enum fd_context_type type;
+};
 
 DNS_SD_REGISTER_TCP_SERVICE(gb_service_advertisement, CONFIG_NET_HOSTNAME,
 	"_greybus", "local", DNS_SD_EMPTY_TXT, GB_TRANSPORT_TCPIP_BASE_PORT);
 
-struct gb_transport_tcpip_context {
-    int server_fd;
-    /* currently, only one simultaneous connection per cport is supported */
-    int client_fd;
-    unsigned int cport;
-    pthread_t client_thread;
-};
+static sys_dlist_t fd_list;
+static pthread_mutex_t fd_list_mutex;
+static pthread_t accept_thread;
+
+static struct fd_context *fd_context_new(int fd, int cport, enum fd_context_type type)
+{
+	struct fd_context *ctx = NULL;
+
+	if (fd < 0) {
+		LOG_ERR("invalid fd %d", fd);
+		return NULL;
+	}
+
+	if (cport < 0 || cport > CPORT_ID_MAX) {
+		LOG_ERR("invalid cport %d", cport);
+		return NULL;
+	}
+
+	if (!(type == FD_CONTEXT_SERVER || type == FD_CONTEXT_CLIENT)) {
+		LOG_ERR("invalid type %u", type);
+		return NULL;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		LOG_ERR("failed to allocate context");
+		return NULL;
+	}
+
+	ctx->fd = fd;
+	ctx->cport = cport;
+	ctx->type = type;
+	sys_dnode_init(&ctx->node);
+
+	return ctx;
+}
+
+static void fd_context_delete(struct fd_context *ctx)
+{
+	if (ctx == NULL) {
+		return;
+	}
+
+	LOG_DBG("closing fd %d", ctx->fd);
+	close(ctx->fd);
+	free(ctx);
+}
+
+static bool fd_context_insert(int fd, int cport, enum fd_context_type type)
+{
+	struct fd_context *ctx;
+	struct fd_context *cnode;
+	int r;
+	bool success = false;
+
+	ctx = fd_context_new(fd, cport, type);
+	if (ctx == NULL) {
+		goto out;
+	}
+
+	r = pthread_mutex_lock(&fd_list_mutex);
+	if (r != 0) {
+		LOG_ERR("failed to lock fd_list_mutex (%d)", r);
+		goto out;
+	}
+
+	SYS_DLIST_FOR_EACH_CONTAINER(&fd_list, cnode, node) {
+		/* check for uniqueness on the fd key */
+		if (cnode->fd == ctx->fd) {
+			LOG_ERR("fd_list already contains fd %d", ctx->fd);
+			goto unlock;
+		}
+	}
+
+	sys_dlist_append(&fd_list, &ctx->node);
+	success = true;
+
+unlock:
+	pthread_mutex_unlock(&fd_list_mutex);
+out:
+	if (!success) {
+		free(ctx);
+	}
+	return success;
+}
+
+static void fd_context_erase_inner(struct fd_context *ctx)
+{
+	if (ctx == NULL) {
+		return;
+	}
+	sys_dlist_remove(&ctx->node);
+	fd_context_delete(ctx);
+}
+
+static bool fd_context_erase(int fd)
+{
+	struct fd_context *cnode;
+	int r;
+	bool success = false;
+	struct fd_context *ctx = NULL;
+
+	r = pthread_mutex_lock(&fd_list_mutex);
+	if (r != 0) {
+		LOG_ERR("failed to lock fd_list_mutex (%d)", r);
+		goto out;
+	}
+
+	SYS_DLIST_FOR_EACH_CONTAINER(&fd_list, cnode, node) {
+		if (cnode->fd == fd) {
+			ctx = cnode;
+			break;
+		}
+	}
+
+	if (ctx == NULL) {
+		LOG_DBG("fd %d is not in list", fd);
+		goto unlock;
+	}
+
+	fd_context_erase_inner(ctx);
+	success = true;
+
+unlock:
+	pthread_mutex_unlock(&fd_list_mutex);
+out:
+	return success;
+}
+
+static void fd_context_clear(void)
+{
+	int r;
+	struct fd_context *ctx;
+	struct fd_context *cnode;
+
+	r = pthread_mutex_lock(&fd_list_mutex);
+	if (r != 0) {
+		LOG_ERR("failed to lock fd_list_mutex (%d)", r);
+		return;
+	}
+
+	for ( ctx = SYS_DLIST_PEEK_HEAD_CONTAINER(&fd_list, cnode, node);
+		ctx != NULL; ctx = SYS_DLIST_PEEK_HEAD_CONTAINER(&fd_list, cnode, node)) {
+		fd_context_erase_inner(ctx);
+	}
+
+	pthread_mutex_unlock(&fd_list_mutex);
+}
+
+static struct fd_context *fd_context_find(int fd, int cport, enum fd_context_type type)
+{
+	struct fd_context *cnode;
+	int r;
+	struct fd_context *ctx = NULL;
+
+	r = pthread_mutex_lock(&fd_list_mutex);
+	if (r != 0) {
+		LOG_ERR("failed to lock fd_list_mutex (%d)", r);
+		goto out;
+	}
+
+	SYS_DLIST_FOR_EACH_CONTAINER(&fd_list, cnode, node) {
+		if (!(fd == -1 || fd == cnode->fd)) {
+			continue;
+		}
+
+		if (!(cport == -1 || cport == cnode->cport)) {
+			continue;
+		}
+
+		if ((type & cnode->type) == 0) {
+			continue;
+		}
+
+		ctx = cnode;
+		break;
+	}
+
+	pthread_mutex_unlock(&fd_list_mutex);
+
+out:
+	return ctx;
+}
+
+static inline struct fd_context *fd_to_context(int fd)
+{
+	return fd_context_find(fd, -1, FD_CONTEXT_ANY);
+}
+
+static inline struct fd_context *cport_to_server_context(int cport)
+{
+	return fd_context_find(-1, cport, FD_CONTEXT_SERVER);
+}
 
 static int getMessage(int fd, struct gb_operation_hdr **msg);
 static int sendMessage(int fd, struct gb_operation_hdr *msg);
-struct pollfd *pollfds;
 
-static size_t num_gb_transport_tcpip_contexts;
-static struct gb_transport_tcpip_context *gb_transport_tcpip_contexts;
-
-static pthread_t accept_thread;
-
-static void *thread_fun(void *arg)
+static void accept_new_connection(struct fd_context *ctx)
 {
-	int r;
-	int i = 0;
-	struct gb_operation_hdr *msg = NULL;
-    struct gb_transport_tcpip_context *ctx = NULL;
-	int *fd = (int *)arg;
-    unsigned int cport = -1;
-
-    if (fd == NULL) {
-    	LOG_ERR("invalid argument");
-    	goto out;
-    }
-
-    for(size_t i = 0; i < num_gb_transport_tcpip_contexts; ++i) {
-        ctx = &gb_transport_tcpip_contexts[i];
-        if (*fd == ctx->client_fd) {
-            cport = ctx->cport;
-            break;
-        }
-    }
-
-    if (ctx == NULL) {
-    	LOG_ERR("no context for fd %d!", *fd);
-    	goto out;
-    }
-
-    if (cport == -1) {
-    	LOG_ERR("cport not found for fd %d!", *fd);
-    	goto out;
-    }
-
-
-	for (;;) {
-		r = getMessage(*fd, &msg);
-		if (0 == r) {
-			LOG_DBG("recv from fd %d returned EOF", *fd);
-			break;
-		}
-		if (r < 0) {
-			LOG_DBG("failed to receive message (%d)", r);
-			break;
-		}
-
-		r = greybus_rx_handler(cport, msg, sys_le16_to_cpu(msg->size));
-		if (r < 0) {
-			LOG_DBG("failed to handle message %u: size: %u, id: %u, type: %u",
-				i, sys_le16_to_cpu(msg->size), sys_le16_to_cpu(msg->id),
-				msg->type);
-		}
-	}
-
-out:
-	if (*fd != -1) {
-		LOG_DBG("closing fd %d", *fd);
-		close(*fd);
-		*fd = -1;
-	}
-
-	return NULL;
-}
-
-static int netsetup(void)
-{
-	int r;
-    int i;
-	const int yes = true;
-	struct sockaddr_in6 addr = {
-		.sin6_family = AF_INET6,
-		.sin6_addr = in6addr_any,
-        .sin6_port = htons(GB_TRANSPORT_TCPIP_BASE_PORT),
-	};
-    struct gb_transport_tcpip_context *ctx; 
-
-    for(i = 0; i < num_gb_transport_tcpip_contexts; ++i) {
-        ctx = &gb_transport_tcpip_contexts[i];
-
-        ctx->server_fd = socket(AF_INET6, SOCK_STREAM, 0);
-        if (ctx->server_fd == -1) {
-            r = -errno;
-            LOG_ERR("socket: %d", errno);
-            goto cleanup;
-        }
-	    LOG_DBG("created server socket %d for cport %u",
-            ctx->server_fd, ctx->cport);
-
-        LOG_DBG("setting socket options for socket %d", ctx->server_fd);
-        r = setsockopt(ctx->server_fd, SOL_SOCKET, SO_REUSEADDR, &yes,
-                sizeof(yes));
-        if (-1 == r) {
-            LOG_ERR("setsockopt: %d", errno);
-            r = -errno;
-            goto cleanup;
-        }
-
-        LOG_DBG("binding socket %d (cport %u) to port %u",
-            ctx->server_fd, ctx->cport, GB_TRANSPORT_TCPIP_BASE_PORT + i);
-    	addr.sin6_port = htons(GB_TRANSPORT_TCPIP_BASE_PORT + i);
-        r = bind(ctx->server_fd, (struct sockaddr *)&addr, sizeof(addr));
-        if (-1 == r) {
-            LOG_ERR("bind: %d", errno);
-            r = -errno;
-            goto cleanup;
-        }
-
-        LOG_DBG("listening on socket %d (cport %u)", ctx->server_fd, ctx->cport);
-        r = listen(ctx->server_fd, GB_TRANSPORT_TCPIP_BACKLOG);
-        if (-1 == r) {
-            LOG_ERR("listen: %d", errno);
-            r = -errno;
-            goto cleanup;
-        }
-    }
-
-    r = 0;
-    goto out;
-
-
-cleanup:
-    for(--i; i >= 0; --i) {
-        ctx = &gb_transport_tcpip_contexts[i];
-        if (ctx != NULL && ctx->server_fd != -1) {
-			close(ctx->server_fd);
-			ctx->server_fd = -1;
-        }
-    }
-
-out:
-    return r;
-}
-
-void prepare_pollfds(void) {
-    struct gb_transport_tcpip_context *ctx; 
-    memset(pollfds, 0, num_gb_transport_tcpip_contexts * sizeof(*pollfds));
-    for(size_t i = 0; i < num_gb_transport_tcpip_contexts; ++i) {
-        ctx = &gb_transport_tcpip_contexts[i];
-		pollfds[i].fd = ctx->server_fd;
-		pollfds[i].events = POLLIN;
-    }
-}
-
-void *accept_loop(void *arg)
-{
-	int r;
-	unsigned int num_pollfds;
+	int fd;
 	struct sockaddr_in6 addr = {
 		.sin6_family = AF_INET6,
 		.sin6_addr = in6addr_any,
@@ -229,62 +282,158 @@ void *accept_loop(void *arg)
 	socklen_t addrlen;
 	static char addrstr[INET6_ADDRSTRLEN];
 	char *addrstrp;
-    struct gb_transport_tcpip_context *ctx;
+
+	__ASSERT_NO_MSG(ctx->type == FD_CONTEXT_SERVER);
+
+    addrlen = sizeof(addr);
+    fd = accept(ctx->fd, (struct sockaddr *)&addr, &addrlen);
+    if (fd == -1) {
+        LOG_ERR("accept: %d", errno);
+        return;
+    }
+
+    memset(addrstr, '\0', sizeof(addrstr));
+    addrstrp = (char *)inet_ntop(addr.sin6_family, &addr.sin6_addr,
+        addrstr, sizeof(addrstr));
+    if (NULL == addrstrp) {
+        LOG_ERR("inet_ntop: %d", errno);
+        return;
+    }
+
+    if (!fd_context_insert(fd, ctx->cport, FD_CONTEXT_CLIENT)) {
+    	close(fd);
+    	return;
+    }
+
+    LOG_DBG("cport %d accepted connection from [%s]:%d as fd %d",
+        ctx->cport, log_strdup(addrstr), ntohs(addr.sin6_port), fd);
+}
+
+static void handle_client_input(struct fd_context *ctx)
+{
+	int r;
+	struct gb_operation_hdr *msg = NULL;
+
+	r = getMessage(ctx->fd, &msg);
+	if (r <= 0) {
+		LOG_DBG("recv from fd %d returned %d", ctx->fd, r);
+		fd_context_erase(ctx->fd);
+		return;
+	}
+
+	r = greybus_rx_handler(ctx->cport, msg, sys_le16_to_cpu(msg->size));
+	if (r < 0) {
+		LOG_DBG("cport %u failed to handle message: size: %u, id: %u, type: %u",
+			ctx->cport, sys_le16_to_cpu(msg->size), sys_le16_to_cpu(msg->id),
+			msg->type);
+		fd_context_erase(ctx->fd);
+	}
+
+	free(msg);
+}
+
+/* return the number of valid entries in the pollfds array */
+static int prepare_pollfds(struct pollfd *pollfds, size_t array_size)
+{
+	int r;
+    struct fd_context *cnode;
+    sys_dnode_t *node;
+    size_t fds;
+
+    memset(pollfds, 0, array_size * sizeof(*pollfds));
+
+	r = pthread_mutex_lock(&fd_list_mutex);
+	if (r != 0) {
+		LOG_ERR("failed to lock fd_list_mutex (%d)", r);
+		r = -r;
+		goto out;
+	}
+
+	fds = 0;
+	SYS_DLIST_FOR_EACH_NODE(&fd_list, node) {
+		++fds;
+	}
+
+	if (fds > array_size) {
+		LOG_ERR("Number of fds (%zu) exceeds number of pollfds available (%zu)", fds, array_size);
+		r = -E2BIG;
+		goto unlock;
+	}
+
+	r = 0;
+	SYS_DLIST_FOR_EACH_CONTAINER(&fd_list, cnode, node) {
+		switch(cnode->type) {
+		case FD_CONTEXT_SERVER:
+#if 0
+			if (!cnode->listen) {
+				continue;
+			}
+			/* FALLTHROUGH */
+#endif
+		case FD_CONTEXT_CLIENT:
+		default:
+			pollfds[r].fd = cnode->fd;
+			pollfds[r].events = POLLIN;
+			r++;
+			break;
+		}
+	}
+
+	r = fds;
+
+unlock:
+    pthread_mutex_unlock(&fd_list_mutex);
+out:
+    return r;
+}
+
+static void *service_thread(void *arg)
+{
+	int r;
+    struct fd_context *ctx;
+    int pollfds_size;
+    static struct pollfd pollfds[CONFIG_NET_SOCKETS_POLL_MAX];
 
 	for (;;) {
-
-        prepare_pollfds();
-
-		LOG_DBG("calling poll");
-		r = poll(pollfds, num_gb_transport_tcpip_contexts, -1);
-		if (-1 == r) {
-			LOG_ERR("poll: %d", errno);
-			return NULL;
+		pollfds_size = prepare_pollfds(pollfds, ARRAY_SIZE(pollfds));
+		if (pollfds_size <= 0) {
+			LOG_DBG("prepare_pollfds() returned %d", pollfds_size);
+			break;
 		}
 
-		num_pollfds = r;
-		LOG_DBG("poll returned %d", num_pollfds);
+		r = poll(pollfds, pollfds_size, -1);
+		if (-1 == r) {
+			LOG_ERR("poll failed: %d", errno);
+			break;
+		}
 
-        for(size_t i = 0; num_pollfds > 0 && i < num_gb_transport_tcpip_contexts; ++i) {
-            if (pollfds[i].revents & POLLIN) {
+    	for(size_t i = 0, revents = r; revents > 0 && i < pollfds_size; ++i) {
+    		if (pollfds[i].revents & POLLIN) {
+            	ctx = fd_to_context(pollfds[i].fd);
+            	if (ctx == NULL) {
+            		/* It's possible that the context was asynchronously deleted */
+            		continue;
+            	}
 
-                ctx = &gb_transport_tcpip_contexts[i];
+            	switch(ctx->type) {
+            	case FD_CONTEXT_SERVER:
+            		accept_new_connection(ctx);
+            		break;
+            	case FD_CONTEXT_CLIENT:
+            		handle_client_input(ctx);
+            		break;
+            	default:
+            		LOG_ERR("ctx@%p has invalid type %u", ctx, ctx->type);
+					break;
+            	}
 
-                LOG_DBG("socket %d (cport %u) has traffic",
-                    ctx->server_fd, ctx->cport);
-
-                addrlen = sizeof(addr);
-                ctx->client_fd =
-                    accept(ctx->server_fd,
-                        (struct sockaddr *)&addr, &addrlen);
-                if (ctx->client_fd == -1) {
-                    LOG_ERR("accept: %d", errno);
-                    return NULL;
-                }
-
-                memset(addrstr, '\0', sizeof(addrstr));
-                addrstrp = (char *)inet_ntop(AF_INET6, &addr.sin6_addr,
-                    addrstr, sizeof(addrstr));
-                if (NULL == addrstrp) {
-                    LOG_ERR("inet_ntop: %d", errno);
-                    return NULL;
-                }
-                LOG_DBG("accepted connection from [%s]:%d as fd %d",
-                    log_strdup(addrstr), ntohs(addr.sin6_port), ctx->client_fd);
-
-                LOG_DBG("spawning client thread..");
-                r = pthread_create(&ctx->client_thread,
-                        NULL, thread_fun,
-                        &ctx->client_fd);
-                if (r != 0) {
-                    LOG_ERR("pthread_create: %d", r);
-                    return NULL;
-                }
-
-                num_pollfds--;
-            }
-        }
+            	--revents;
+    		}
+    	}
 	}
+
+	LOG_WRN("Greybus is quitting");
+	fd_context_clear();
 
 	return NULL;
 }
@@ -319,11 +468,6 @@ read_header:
 
 		r = recv(fd, &((uint8_t *)*msg)[offset], remaining, 0);
 		if (r < 0) {
-			LOG_DBG("recv failed. errno: %d", errno);
-			goto freemsg;
-		}
-		if (0 == r) {
-			LOG_DBG("recv returned 0 - EOF??");
 			goto freemsg;
 		}
 		recvd = r;
@@ -388,61 +532,94 @@ static int sendMessage(int fd, struct gb_operation_hdr *msg)
 
 	for (remaining = sys_le16_to_cpu(msg->size), offset = 0, written = 0;
 	     remaining; remaining -= written, offset += written, written = 0) {
+
 		r = send(fd, &((uint8_t *)msg)[offset], remaining, 0);
+
 		if (r < 0) {
 			LOG_ERR("send: %d", errno);
-			return r;
+			return -errno;
 		}
+
 		if (0 == r) {
 			LOG_ERR("send returned 0 - EOF?");
-			return -1;
+			return -ENOTCONN;
 		}
+
 		written = r;
 	}
 
-	r = 0;
-
-	return r;
+	return 0;
 }
 
 static void gb_xport_init(void)
 {
+	LOG_DBG("");
 }
 static void gb_xport_exit(void)
 {
+	LOG_DBG("");
 }
-static int gb_xport_listen(unsigned int cport)
+
+static int gb_xport_listen_start(unsigned int cport)
 {
+#if 0
+	int r;
+	struct fd_context *ctx;
+
+	ctx = cport_to_server_context(cport);
+	if (ctx == NULL) {
+		LOG_ERR("Failed to find server context for cport %d", cport);
+		r = -EINVAL;
+		goto out;
+	}
+
+	LOG_DBG("cport %d", cport);
+	ctx->listen = true;
+	r = 0;
+
+out:
+	return r;
+#else
+	LOG_DBG("cport %d", cport);
 	return 0;
+#endif
 }
-static int gb_xport_stop_listening(unsigned int cport)
+
+static int gb_xport_listen__stop(unsigned int cport)
 {
+#if 0
+	int r;
+	struct fd_context *ctx;
+
+	ctx = cport_to_server_context(cport);
+	if (ctx == NULL) {
+		LOG_ERR("Failed to find server context for cport %d", cport);
+		r = -EINVAL;
+		goto out;
+	}
+
+	LOG_DBG("cport %d", cport);
+	ctx->listen = false;
+	r = 0;
+
+out:
+	return r;
+#else
+	LOG_DBG("cport %d", cport);
 	return 0;
+#endif
 }
+
 static int gb_xport_send(unsigned int cport, const void *buf, size_t len)
 {
 	int r;
-	int fd = -1;
 	struct gb_operation_hdr *msg;
-	struct gb_transport_tcpip_context *ctx;
+	struct fd_context *ctx;
 
 	msg = (struct gb_operation_hdr *)buf;
     if (NULL == msg) {
 		LOG_ERR("message is NULL");
 	    return -EINVAL;
-	}
-
-	for(size_t i = 0; i < num_gb_transport_tcpip_contexts; ++i) {
-		ctx = &gb_transport_tcpip_contexts[i];
-		if (ctx->cport == cport) {
-			fd = ctx->client_fd;
-			break;
-		}
-	}
-
-	if (fd == -1) {
-		LOG_ERR("unable to find fd corresponding to cport %u", cport);
-		return -EINVAL;
 	}
 
     if (sys_le16_to_cpu(msg->size) != len || len < sizeof(*msg)) {
@@ -451,15 +628,32 @@ static int gb_xport_send(unsigned int cport, const void *buf, size_t len)
         return -EINVAL;
     }
 
-	r = sendMessage(fd, msg);
+    ctx = fd_context_find(-1, cport, FD_CONTEXT_CLIENT);
+    if (ctx == NULL) {
+    	LOG_ERR("failed to find client fd_context for cport %d", cport);
+    	return -EINVAL;
+    }
 
-	return r;
+    r = sendMessage(ctx->fd, msg);
+    if (r != 0) {
+    	fd_context_erase(ctx->fd);
+    }
+
+    return r;
 }
+
 static void *gb_xport_alloc_buf(size_t size)
 {
-	return malloc(size);
+	void *p = malloc(size);
+
+	if (!p) {
+		LOG_ERR("Failed to allocate %zu bytes", size);
+	}
+
+	return p;
 }
-static void gb_xport_free_buf(void *ptr)
+
+static void gb_xport_free__buf(void *ptr)
 {
 	free(ptr);
 }
@@ -467,67 +661,92 @@ static void gb_xport_free_buf(void *ptr)
 static const struct gb_transport_backend gb_xport = {
 	.init = gb_xport_init,
 	.exit = gb_xport_exit,
-	.listen = gb_xport_listen,
-	.stop_listening = gb_xport_stop_listening,
+	.listen = gb_xport_listen_start,
+	.stop_listening = gb_xport_listen__stop,
 	.send = gb_xport_send,
 	.send_async = NULL,
 	.alloc_buf = gb_xport_alloc_buf,
-	.free_buf = gb_xport_free_buf,
+	.free_buf = gb_xport_free__buf,
 };
+
+static int netsetup(int *cports, size_t num_cports)
+{
+	int r;
+	int fd;
+    size_t i;
+	const int yes = true;
+	struct sockaddr_in6 addr = {
+		.sin6_family = AF_INET6,
+		.sin6_addr = in6addr_any,
+        .sin6_port = htons(GB_TRANSPORT_TCPIP_BASE_PORT),
+	};
+
+    for(i = 0; i < num_cports; ++i) {
+        fd = socket(AF_INET6, SOCK_STREAM, 0);
+        if (fd == -1) {
+            LOG_ERR("socket: %d", errno);
+            return -errno;
+        }
+
+        if (!fd_context_insert(fd, cports[i], FD_CONTEXT_SERVER)) {
+        	LOG_ERR("failed to add fd context for cport %d", cports[i]);
+        	close(fd);
+        	return -EINVAL;
+        }
+
+        r = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        if (-1 == r) {
+            LOG_ERR("setsockopt: %d", errno);
+            return -errno;
+        }
+
+    	addr.sin6_port = htons(GB_TRANSPORT_TCPIP_BASE_PORT + i);
+        r = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+        if (-1 == r) {
+            LOG_ERR("bind: %d", errno);
+            return -errno;
+        }
+
+        r = listen(fd, GB_TRANSPORT_TCPIP_BACKLOG);
+        if (-1 == r) {
+            LOG_ERR("listen: %d", errno);
+            return -errno;
+        }
+
+        LOG_INF("CPort %d mapped to TCP/IP port %u",
+			cports[i], GB_TRANSPORT_TCPIP_BASE_PORT + i);
+    }
+
+    return 0;
+}
 
 struct gb_transport_backend *gb_transport_backend_init(unsigned int *cports, size_t num_cports) {
 
     int r;
-    struct gb_transport_tcpip_context *ctx;
-    struct gb_transport_backend *ret;
-
-	if (num_gb_transport_tcpip_contexts != 0) {
-		LOG_ERR("Greybus TCP/IP Transport has already been initialized");
-		return NULL;
-	}
+    struct gb_transport_backend *ret = NULL;
 
 	LOG_DBG("Greybus TCP/IP Transport initializing..");
 
+	pthread_mutex_init(&fd_list_mutex, NULL);
+	sys_dlist_init(&fd_list);
     if (num_cports >= CPORT_ID_MAX) {
         LOG_ERR("invalid number of cports %u", (unsigned)num_cports);
-        ret = NULL;
         goto out;
     }
 
-    pollfds = realloc(pollfds, num_cports * sizeof(*pollfds));
-    if (pollfds == NULL) {
-        LOG_ERR("failed to allocate file descriptors");
-        ret = NULL;
-        goto out;
-    }
-
-    ctx = realloc(gb_transport_tcpip_contexts, num_cports * sizeof(*gb_transport_tcpip_contexts));
-    if (ctx == NULL) {
-        LOG_ERR("failed to allocate file descriptors");
-        ret = NULL;
-        goto cleanup;
-    }
-
-    num_gb_transport_tcpip_contexts = num_cports;
-    gb_transport_tcpip_contexts = ctx;
-
-    for(size_t i = 0; i < num_cports; ++i) {
-        ctx = &gb_transport_tcpip_contexts[i];
-        ctx->server_fd = -1;
-        ctx->client_fd = -1;
-        ctx->cport = cports[i];
-    }
-
-    r = netsetup();
+    r = netsetup(cports, num_cports);
     if (r < 0) {
+    	LOG_ERR("netsetup() failed: %d", r);
         goto cleanup;
     }
 
-	r = pthread_create(&accept_thread, NULL, accept_loop, NULL);
+	r = pthread_create(&accept_thread, NULL, service_thread, NULL);
 	if (r != 0) {
 		LOG_ERR("pthread_create: %d", r);
 		goto cleanup;
 	}
+
+	(void)pthread_setname_np(accept_thread, "greybus");
 
     ret = (struct gb_transport_backend *)&gb_xport;
 
@@ -535,15 +754,7 @@ struct gb_transport_backend *gb_transport_backend_init(unsigned int *cports, siz
 	goto out;
 
 cleanup:
-    if (pollfds != NULL) {
-        free(pollfds);
-        pollfds = NULL;
-    }
-    num_gb_transport_tcpip_contexts = 0;
-    if (gb_transport_tcpip_contexts != NULL) {
-        free(gb_transport_tcpip_contexts);
-        gb_transport_tcpip_contexts = NULL;
-    }
+	fd_context_clear();
 
 out:
     return ret;

@@ -33,10 +33,10 @@
 #include <unipro/unipro.h>
 #include <greybus/greybus.h>
 #include <greybus/tape.h>
-#include <greybus/debug.h>
 //#include <wdog.h>
 #include "greybus-stubs.h"
 //#include <loopback-gb.h>
+#include <logging/log.h>
 
 #include <greybus-utils/manifest.h>
 
@@ -56,6 +56,8 @@
 #include <string.h>
 #include <errno.h>
 
+LOG_MODULE_REGISTER(greybus, LOG_LEVEL_INF);
+
 #if !defined(CONFIG_POSIX_API)
 /*
  * Currently CONFIG_POSIX_API is incompatible with
@@ -73,7 +75,7 @@ static int _m_clock_gettime(clockid_t clk_id, struct timespec *tp) {
 }
 #endif
 
-#define DEFAULT_STACK_SIZE      2048
+#define DEFAULT_STACK_SIZE      CONFIG_PTHREAD_DYNAMIC_STACK_SIZE
 #define TIMEOUT_IN_MS           1000
 #define GB_PING_TYPE            0x00
 
@@ -246,7 +248,7 @@ static void gb_process_request(struct gb_operation_hdr *hdr,
 
     op_handler = find_operation_handler(hdr->type, operation->cport);
     if (!op_handler) {
-        gb_error("Cport %u: Invalid operation type %u\n",
+        LOG_ERR("Cport %u: Invalid operation type %u",
                  operation->cport, hdr->type);
         gb_operation_send_response(operation, GB_OP_INVALID);
         return;
@@ -255,7 +257,7 @@ static void gb_process_request(struct gb_operation_hdr *hdr,
     operation->bundle = g_cport[operation->cport].driver->bundle;
 
     result = op_handler->handler(operation);
-    gb_debug("%s: %u\n", gb_handler_name(op_handler), result);
+    LOG_DBG("%s: %u", log_strdup(gb_handler_name(op_handler)), result);
 
     if (hdr->id)
         gb_operation_send_response(operation, result);
@@ -364,7 +366,7 @@ static void gb_process_response(struct gb_operation_hdr *hdr,
         return;
     }
 
-    gb_error("CPort %u: cannot find matching request for response %hu. Dropping message.\n",
+    LOG_ERR("CPort %u: cannot find matching request for response %hu. Dropping message.",
              operation->cport, sys_le16_to_cpu(hdr->id));
 }
 
@@ -451,28 +453,28 @@ int greybus_rx_handler(unsigned int cport, void *data, size_t size)
 
     gb_loopback_log_entry(cport);
     if (cport >= cport_count || !data) {
-        gb_error("Invalid cport number: %u\n", cport);
+        LOG_ERR("Invalid cport number: %u", cport);
         return -EINVAL;
     }
 
     if (!g_cport[cport].driver || !g_cport[cport].driver->op_handlers) {
-        gb_error("Cport %u does not have a valid driver registered\n", cport);
+        LOG_ERR("Cport %u does not have a valid driver registered", cport);
         return 0;
     }
 
     if (sizeof(*hdr) > size) {
-        gb_error("Dropping garbage request\n");
+        LOG_ERR("Dropping garbage request");
         return -EINVAL; /* Dropping garbage request */
     }
 
     hdr_size = sys_le16_to_cpu(hdr->size);
 
     if (hdr_size > size || sizeof(*hdr) > hdr_size) {
-        gb_error("Dropping garbage request\n");
+        LOG_ERR("Dropping garbage request");
         return -EINVAL; /* Dropping garbage request */
     }
 
-    gb_dump(data, size);
+    //LOG_HEXDUMP_DBG(data, size, "RX: ");
 
     if (gb_tape && gb_tape_fd >= 0) {
         struct gb_tape_record_header record_hdr = {
@@ -486,7 +488,7 @@ int greybus_rx_handler(unsigned int cport, void *data, size_t size)
 
     op_handler = find_operation_handler(hdr->type, cport);
     if (op_handler && op_handler->fast_handler) {
-        gb_debug("%s\n", gb_handler_name(op_handler));
+        LOG_DBG("%s", gb_handler_name(op_handler));
         op_handler->fast_handler(cport, data);
         return 0;
     }
@@ -548,31 +550,31 @@ int _gb_register_driver(unsigned int cport, int bundle_id,
     struct gb_bundle *bundle;
     int retval;
 
-    gb_debug("Registering Greybus driver on CP%u\n", cport);
+    LOG_DBG("Registering Greybus driver on CP%u", cport);
 
     if (cport >= cport_count) {
-        gb_error("Invalid cport number %u\n", cport);
+        LOG_ERR("Invalid cport number %u", cport);
         return -EINVAL;
     }
 
     if (!driver) {
-        gb_error("No driver to register\n");
+        LOG_ERR("No driver to register");
         return -EINVAL;
     }
 
     if (g_cport[cport].driver) {
-        gb_error("%s is already registered for CP%u\n",
+        LOG_ERR("%s is already registered for CP%u",
                  gb_driver_name(g_cport[cport].driver), cport);
         return -EEXIST;
     }
 
     if (!driver->op_handlers && driver->op_handlers_count > 0) {
-        gb_error("Invalid driver\n");
+        LOG_ERR("Invalid driver");
         return -EINVAL;
     }
 
     if (bundle_id >= 0 && bundle_id > manifest_get_max_bundle_id()) {
-        gb_error("invalid bundle_id: %d\n", bundle_id);
+        LOG_ERR("invalid bundle_id: %d", bundle_id);
         return -EINVAL;
     }
 
@@ -602,7 +604,7 @@ int _gb_register_driver(unsigned int cport, int bundle_id,
     if (driver->init) {
         retval = driver->init(cport, bundle);
         if (retval) {
-            gb_error("Can not init %s\n", gb_driver_name(driver));
+            LOG_ERR("Can not init %s", gb_driver_name(driver));
             return retval;
         }
     }
@@ -627,8 +629,13 @@ int _gb_register_driver(unsigned int cport, int bundle_id,
 
     retval = pthread_create(&g_cport[cport].thread, &thread_attr,
                             gb_pending_message_worker, (void *)((intptr_t) cport));
-    if (retval)
+    if (retval) {
         goto pthread_create_error;
+    }
+
+	char thread_name[CONFIG_THREAD_MAX_NAME_LEN];
+	(void)snprintf(thread_name, sizeof(thread_name), "greybus[%u]", cport);
+	(void)pthread_setname_np(g_cport[cport].thread, thread_name);
 
     pthread_attr_destroy(&thread_attr);
     thread_attr_ptr = NULL;
@@ -642,7 +649,7 @@ pthread_attr_setstacksize_error:
     if (thread_attr_ptr != NULL)
         pthread_attr_destroy(&thread_attr);
 pthread_attr_init_error:
-    gb_error("Can not create thread for %s\n: ", gb_driver_name(driver));
+    LOG_ERR("Can not create thread for %s", gb_driver_name(driver));
     if (driver->exit)
         driver->exit(cport, bundle);
     return retval;
@@ -654,12 +661,12 @@ int gb_listen(unsigned int cport)
     DEBUGASSERT(transport_backend->listen);
 
     if (cport >= cport_count) {
-        gb_error("Invalid cport number %u\n", cport);
+        LOG_ERR("Invalid cport number %u", cport);
         return -EINVAL;
     }
 
     if (!g_cport[cport].driver) {
-        gb_error("No driver registered! Can not connect CP%u.\n", cport);
+        LOG_ERR("No driver registered! Can not connect CP%u.", cport);
         return -EINVAL;
     }
 
@@ -672,12 +679,12 @@ int gb_stop_listening(unsigned int cport)
     DEBUGASSERT(transport_backend->stop_listening);
 
     if (cport >= cport_count) {
-        gb_error("Invalid cport number %u\n", cport);
+        LOG_ERR("Invalid cport number %u", cport);
         return -EINVAL;
     }
 
     if (!g_cport[cport].driver) {
-        gb_error("No driver registered! Can not disconnect CP%u.\n",
+        LOG_ERR("No driver registered! Can not disconnect CP%u.",
                  cport);
         return -EINVAL;
     }
@@ -742,7 +749,7 @@ int gb_operation_send_request_nowait(struct gb_operation *operation,
     hdr->id = 0;
     operation->callback = callback;
 
-    gb_dump(operation->request_buffer, hdr->size);
+    //LOG_HEXDUMP_DBG(operation->request_buffer, hdr->size, "TX: ");
 
     gb_operation_ref(operation);
 
@@ -791,7 +798,7 @@ int gb_operation_send_request(struct gb_operation *operation,
         }
     }
 
-    gb_dump(operation->request_buffer, hdr->size);
+    //LOG_HEXDUMP_DBG(operation->request_buffer, hdr->size, "TX: ");
     retval = transport_backend->send(operation->cport,
                                      operation->request_buffer,
                                      sys_le16_to_cpu(hdr->size));
@@ -879,15 +886,15 @@ int gb_operation_send_response(struct gb_operation *operation, uint8_t result)
     resp_hdr = operation->response_buffer;
     resp_hdr->result = result;
 
-    gb_dump(operation->response_buffer, resp_hdr->size);
+    //LOG_HEXDUMP_DBG(operation->response_buffer, resp_hdr->size, "TX: ");
     gb_loopback_log_exit(operation->cport, operation, resp_hdr->size);
     retval = transport_backend->send(operation->cport,
                                      operation->response_buffer,
                                      sys_le16_to_cpu(resp_hdr->size));
     if (retval) {
-        gb_error("Greybus backend failed to send: error %d\n", retval);
+        LOG_ERR("Greybus backend failed to send: error %d", retval);
         if (has_allocated_response) {
-            gb_debug("Free the response buffer\n");
+            LOG_DBG("Free the response buffer");
             transport_backend->free_buf(operation->response_buffer);
             operation->response_buffer = NULL;
         }
@@ -908,7 +915,7 @@ void *gb_operation_alloc_response(struct gb_operation *operation, size_t size)
     operation->response_buffer =
         transport_backend->alloc_buf(size + sizeof(*resp_hdr));
     if (!operation->response_buffer) {
-        gb_error("Can not allocate a response_buffer\n");
+        LOG_ERR("Can not allocate a response_buffer");
         return NULL;
     }
 
@@ -1184,14 +1191,14 @@ int gb_tape_replay(const char *pathname)
             break;
 
         if (nread != sizeof(hdr)) {
-            gb_error("gb-tape: invalid byte count read, aborting...\n");
+            LOG_ERR("gb-tape: invalid byte count read, aborting...");
             retval = -EIO;
             break;
         }
 
         nread = gb_tape->read(fd, buffer, hdr.size);
         if (hdr.size != nread) {
-            gb_error("gb-tape: invalid byte count read, aborting...\n");
+            LOG_ERR("gb-tape: invalid byte count read, aborting...");
             retval = -EIO;
             break;
         }
