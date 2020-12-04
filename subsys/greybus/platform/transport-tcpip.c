@@ -45,10 +45,8 @@ int usleep(useconds_t usec) {
 
 #endif
 
-//#define LOG_LEVEL CONFIG_GB_LOG_LEVEL
-#define LOG_LEVEL LOG_LEVEL_DBG
 #include <logging/log.h>
-LOG_MODULE_REGISTER(greybus_transport_tcpip);
+LOG_MODULE_REGISTER(greybus_transport_tcpip, LOG_LEVEL_INF);
 
 #include "transport.h"
 
@@ -56,7 +54,7 @@ LOG_MODULE_REGISTER(greybus_transport_tcpip);
 #define CPORT_ID_MAX 4095
 
 #define GB_TRANSPORT_TCPIP_BASE_PORT 4242
-#define GB_TRANSPORT_TCPIP_BACKLOG 0
+#define GB_TRANSPORT_TCPIP_BACKLOG 10
 
 enum fd_context_type {
 	FD_CONTEXT_SERVER = 1,
@@ -118,7 +116,6 @@ static void fd_context_delete(struct fd_context *ctx)
 		return;
 	}
 
-	LOG_DBG("closing fd %d", ctx->fd);
 	close(ctx->fd);
 	free(ctx);
 }
@@ -315,20 +312,33 @@ static void handle_client_input(struct fd_context *ctx)
 	struct gb_operation_hdr *msg = NULL;
 
 	r = getMessage(ctx->fd, &msg);
-	if (r <= 0) {
-		LOG_DBG("recv from fd %d returned %d", ctx->fd, r);
-		fd_context_erase(ctx->fd);
-		return;
+	if (r == 0) {
+		/* Connection was shut down gracefully */
+		goto close_conn;
+	}
+
+	if (r < 0) {
+		LOG_ERR("fd %d returned %d", ctx->fd, r);
+		goto close_conn;
 	}
 
 	r = greybus_rx_handler(ctx->cport, msg, sys_le16_to_cpu(msg->size));
-	if (r < 0) {
-		LOG_DBG("cport %u failed to handle message: size: %u, id: %u, type: %u",
-			ctx->cport, sys_le16_to_cpu(msg->size), sys_le16_to_cpu(msg->id),
-			msg->type);
-		fd_context_erase(ctx->fd);
+	if (r == 0) {
+		/* Message handled properly */
+		goto free_msg;
 	}
 
+	__ASSERT_NO_MSG(r < 0);
+
+	LOG_ERR("cport %u failed to handle message: size: %u, id: %u, type: %u",
+		ctx->cport, sys_le16_to_cpu(msg->size), sys_le16_to_cpu(msg->id),
+		msg->type);
+
+close_conn:
+	LOG_DBG("closing fd %d", ctx->fd);
+	fd_context_erase(ctx->fd);
+
+free_msg:
 	free(msg);
 }
 
@@ -364,12 +374,6 @@ static int prepare_pollfds(struct pollfd *pollfds, size_t array_size)
 	SYS_DLIST_FOR_EACH_CONTAINER(&fd_list, cnode, node) {
 		switch(cnode->type) {
 		case FD_CONTEXT_SERVER:
-#if 0
-			if (!cnode->listen) {
-				continue;
-			}
-			/* FALLTHROUGH */
-#endif
 		case FD_CONTEXT_CLIENT:
 		default:
 			pollfds[r].fd = cnode->fd;
@@ -407,29 +411,29 @@ static void *service_thread(void *arg)
 			break;
 		}
 
-    	for(size_t i = 0, revents = r; revents > 0 && i < pollfds_size; ++i) {
-    		if (pollfds[i].revents & POLLIN) {
-            	ctx = fd_to_context(pollfds[i].fd);
-            	if (ctx == NULL) {
-            		/* It's possible that the context was asynchronously deleted */
-            		continue;
-            	}
+		for(size_t i = 0, revents = r; revents > 0 && i < pollfds_size; ++i) {
+			if (pollfds[i].revents & POLLIN) {
+				ctx = fd_to_context(pollfds[i].fd);
 
-            	switch(ctx->type) {
-            	case FD_CONTEXT_SERVER:
-            		accept_new_connection(ctx);
-            		break;
-            	case FD_CONTEXT_CLIENT:
-            		handle_client_input(ctx);
-            		break;
-            	default:
-            		LOG_ERR("ctx@%p has invalid type %u", ctx, ctx->type);
-					break;
-            	}
+				if (ctx == NULL) {
+					LOG_DBG("ctx is NULL");
+				} else {
+					switch(ctx->type) {
+					case FD_CONTEXT_SERVER:
+						accept_new_connection(ctx);
+						break;
+					case FD_CONTEXT_CLIENT:
+						handle_client_input(ctx);
+						break;
+					default:
+						LOG_ERR("ctx@%p has invalid type %u", ctx, ctx->type);
+						break;
+					}
+				}
 
-            	--revents;
-    		}
-    	}
+				--revents;
+			}
+		}
 	}
 
 	LOG_WRN("Greybus is quitting");
@@ -450,77 +454,74 @@ static int getMessage(int fd, struct gb_operation_hdr **msg)
 
 	if (NULL == msg) {
 		LOG_DBG("One or more arguments were NULL or invalid");
-		r = -EINVAL;
-		goto out;
+		return -EINVAL;
 	}
 
 	tmp = realloc(*msg, sizeof(**msg));
 	if (NULL == tmp) {
 		LOG_DBG("Failed to allocate memory");
-		r = -ENOMEM;
-		goto out;
+		return -ENOMEM;
 	}
+
 	*msg = tmp;
 
-read_header:
 	for (remaining = sizeof(**msg), offset = 0, recvd = 0; remaining;
 	     remaining -= recvd, offset += recvd, recvd = 0) {
 
 		r = recv(fd, &((uint8_t *)*msg)[offset], remaining, 0);
-		if (r < 0) {
-			goto freemsg;
+		if (r == 0) {
+			/* Connection shut down gracefully */
+			return 0;
 		}
+
+		if (r == -1) {
+			return -errno;
+		}
+
 		recvd = r;
 	}
 
 	msg_size = sys_le16_to_cpu((*msg)->size);
 	if (msg_size < sizeof(struct gb_operation_hdr)) {
 		LOG_DBG("invalid message size %u", (unsigned)msg_size);
-		goto read_header;
+		return -EINVAL;
 	}
 
 	payload_size = msg_size - sizeof(**msg);
 	if (payload_size > GB_MAX_PAYLOAD_SIZE) {
 		LOG_DBG("invalid payload size %u", (unsigned)payload_size);
-		goto read_header;
+		return -EINVAL;
 	}
 
 	if (payload_size > 0) {
 		tmp = realloc(*msg, msg_size);
 		if (NULL == tmp) {
 			LOG_DBG("Failed to allocate memory");
-			r = -ENOMEM;
-			goto freemsg;
+			return -ENOMEM;
 		}
+
 		*msg = tmp;
 
 		for (remaining = payload_size, offset = sizeof(**msg),
 		    recvd = 0;
 		     remaining;
 		     remaining -= recvd, offset += recvd, recvd = 0) {
+
 			r = recv(fd, &((uint8_t *)*msg)[offset], remaining, 0);
+			if (r == 0) {
+				/* Connection shut down gracefully */
+				return 0;
+			}
+
 			if (r < 0) {
-				LOG_DBG("tty_read failed (%d)", r);
-				usleep(100);
-				continue;
+				return -errno;
 			}
-			if (0 == r) {
-				LOG_DBG("tty_read returned 0 - EOF??");
-				goto freemsg;
-			}
+
 			recvd = r;
 		}
 	}
 
-	r = msg_size;
-	goto out;
-
-freemsg:
-	free(*msg);
-	*msg = NULL;
-
-out:
-	return r;
+	return msg_size;
 }
 
 static int sendMessage(int fd, struct gb_operation_hdr *msg)
@@ -562,52 +563,14 @@ static void gb_xport_exit(void)
 
 static int gb_xport_listen_start(unsigned int cport)
 {
-#if 0
-	int r;
-	struct fd_context *ctx;
-
-	ctx = cport_to_server_context(cport);
-	if (ctx == NULL) {
-		LOG_ERR("Failed to find server context for cport %d", cport);
-		r = -EINVAL;
-		goto out;
-	}
-
-	LOG_DBG("cport %d", cport);
-	ctx->listen = true;
-	r = 0;
-
-out:
-	return r;
-#else
 	LOG_DBG("cport %d", cport);
 	return 0;
-#endif
 }
 
 static int gb_xport_listen__stop(unsigned int cport)
 {
-#if 0
-	int r;
-	struct fd_context *ctx;
-
-	ctx = cport_to_server_context(cport);
-	if (ctx == NULL) {
-		LOG_ERR("Failed to find server context for cport %d", cport);
-		r = -EINVAL;
-		goto out;
-	}
-
-	LOG_DBG("cport %d", cport);
-	ctx->listen = false;
-	r = 0;
-
-out:
-	return r;
-#else
 	LOG_DBG("cport %d", cport);
 	return 0;
-#endif
 }
 
 static int gb_xport_send(unsigned int cport, const void *buf, size_t len)

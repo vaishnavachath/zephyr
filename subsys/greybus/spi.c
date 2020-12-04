@@ -36,6 +36,7 @@
 #include <greybus-utils/utils.h>
 #include <sys/byteorder.h>
 #include <zephyr.h>
+#include <logging/log.h>
 
 #if defined(CONFIG_BOARD_NATIVE_POSIX_64BIT) \
     || defined(CONFIG_BOARD_NATIVE_POSIX_32BIT) \
@@ -47,6 +48,8 @@ extern int usleep(useconds_t usec);
 #endif
 
 #include "spi-gb.h"
+
+LOG_MODULE_REGISTER(greybus_spi, LOG_LEVEL_INF);
 
 #define GB_SPI_VERSION_MAJOR 0
 #define GB_SPI_VERSION_MINOR 1
@@ -157,7 +160,7 @@ static uint8_t gb_spi_protocol_device_config(struct gb_operation *operation)
 
     request_size = gb_operation_get_request_payload_size(operation);
     if (request_size < sizeof(*request)) {
-        gb_error("dropping short message\n");
+        LOG_ERR("dropping short message");
         return GB_OP_INVALID;
     }
 
@@ -182,36 +185,11 @@ static uint8_t gb_spi_protocol_device_config(struct gb_operation *operation)
     return GB_OP_SUCCESS;
 }
 
-static inline int device_spi_lock(struct device *dev)
-{
-    ARG_UNUSED(dev);
-    return 0;
-}
-
-static inline int device_spi_unlock(struct device *dev)
-{
-    ARG_UNUSED(dev);
-    return 0;
-}
-
-static inline int device_spi_select(struct device *dev, uint8_t chip_select)
-{
-    ARG_UNUSED(dev);
-    ARG_UNUSED(chip_select);
-    return 0;
-}
-
-static int device_spi_deselect(struct device *dev, uint8_t chip_select)
-{
-    ARG_UNUSED(dev);
-    ARG_UNUSED(chip_select);
-    return 0;
-}
-
 static int request_to_spi_config(const struct gb_spi_transfer_request *const request,
 	const size_t freq, const uint8_t bits_per_word, struct device *const spi_dev, struct spi_config *const spi_config, struct spi_cs_control *ctrl)
 {
     struct device *const gb_spidev = gb_spidev_from_zephyr_spidev(spi_dev);
+
     if (gb_spidev == NULL) {
     	return -ENODEV;
     }
@@ -289,39 +267,24 @@ static int request_to_spi_config(const struct gb_spi_transfer_request *const req
  */
 static uint8_t gb_spi_protocol_transfer(struct gb_operation *operation)
 {
-    /*
-     * FIXME: This function needs to be rewritten to properly use Zephyr's
-     * SPI API. Specifically, Zephyr's API already handles batch transfers
-     * and chip selects properly, while this code does not (e.g. 'selected'
-     * only accounts for the possibility of 1 chip_select).
-     *
-     * Actually, on review, it does not seem that Zephyr's SPI API works
-     * for batched transfers when transfers might use different GPIO lines.
-     * We are forced to perform one transfer at a time until that is fixed.
-     *
-     * Will need to malloc
-     * 1) struct spi_buf[] for tx
-     * 2) struct spi_buf[] for rx
-     * 3) struct spi_cs_control[]
-     */
-
     struct gb_spi_transfer_desc *desc;
     struct gb_spi_transfer_request *request;
     struct gb_spi_transfer_response *response;
     struct spi_config spi_config;
     struct spi_cs_control spi_cs_control;
-    struct spi_buf tx_buf;
-    struct spi_buf rx_buf;
-    const struct spi_buf_set tx_bufs = {
-		.buffers = &tx_buf,
-		.count = 1,
-    };
-    struct spi_buf_set rx_bufs;
 
-    uint32_t size = 0, freq = 0;
-    uint8_t *write_data, *read_buf;
-    bool selected = false;
+    struct spi_buf_set _tx_buf_set;
+    struct spi_buf_set *const tx_buf_set = &_tx_buf_set;
+    struct spi_buf *tx_buf = NULL;
+
+    struct spi_buf_set _rx_buf_set;
+    struct spi_buf_set *rx_buf_set = &_rx_buf_set;
+    struct spi_buf *rx_buf = NULL;
+
+    uint32_t read_data_size = 0;
+    uint8_t *write_data, *read_data;
     int i, op_count;
+    uint8_t bits_per_word;
     int ret = 0, errcode = GB_OP_SUCCESS;
     size_t request_size;
     size_t expected_size;
@@ -331,129 +294,139 @@ static uint8_t gb_spi_protocol_transfer(struct gb_operation *operation)
 
     request_size = gb_operation_get_request_payload_size(operation);
     if (request_size < sizeof(*request)) {
-        gb_error("dropping short message\n");
-        return GB_OP_INVALID;
+        LOG_ERR("dropping short message");
+        errcode = GB_OP_INVALID;
+        goto out;
     }
 
     request = gb_operation_get_request_payload(operation);
     op_count = sys_le16_to_cpu(request->count);
 
-    expected_size = sizeof(*request) +
-                    op_count * sizeof(request->transfers[0]);
-    if (request_size < expected_size) {
-        gb_error("dropping short message\n");
-        return GB_OP_INVALID;
+    if (op_count == 0) {
+		return GB_OP_SUCCESS;
     }
 
     write_data = (uint8_t *)&request->transfers[op_count];
+    bits_per_word = request->transfers[0].bits_per_word;
 
-    for (i = 0, size = 0; i < op_count; i++) {
+    for (i = 0, read_data_size = 0; i < op_count; ++i) {
         desc = &request->transfers[i];
         if (desc->rdwr & GB_SPI_XFER_READ) {
-            size += sys_le32_to_cpu(desc->len);
+			if (sys_le32_to_cpu(desc->len) == 0) {
+				LOG_ERR("read operation of length 0 is invalid");
+				return GB_OP_INVALID;
+			}
+			read_data_size += sys_le32_to_cpu(desc->len);
+		}
+
+        /* ensure 1 bpw setting */
+        if (desc->bits_per_word != bits_per_word) {
+			LOG_ERR("only 1 bpw setting supported");
+			return GB_OP_INVALID;
+        }
+
+        /* ensure no cs_change */
+        if (desc->cs_change) {
+			LOG_ERR("cs_change not supported");
+			return GB_OP_INVALID;
         }
     }
 
-    response = gb_operation_alloc_response(operation, size);
-    if (!response) {
-        return GB_OP_NO_MEMORY;
-    }
-    read_buf = response->data;
+    tx_buf = malloc(op_count * 2 * sizeof(*tx_buf));
+    rx_buf = &tx_buf[op_count];
+	if (tx_buf == NULL) {
+		free(tx_buf);
+		LOG_ERR("Failed to allocate buffer descriptors");
+		errcode = GB_OP_NO_MEMORY;
+		goto out;
+	}
 
-    /* lock SPI bus */
-    ret = device_spi_lock(bundle->dev);
-    if (ret) {
-        return (ret == -EINVAL)? GB_OP_INVALID : GB_OP_UNKNOWN_ERROR;
+    expected_size = sizeof(*request) +
+                    op_count * sizeof(request->transfers[0]);
+    if (request_size < expected_size) {
+        LOG_ERR("dropping short message");
+        errcode = GB_OP_INVALID;
+        goto freebufs;
+    }
+
+    response = gb_operation_alloc_response(operation, read_data_size);
+    if (!response) {
+		errcode = GB_OP_NO_MEMORY;
+		goto freebufs;
     }
 
     /* parse all transfer request from AP host side */
-    for (i = 0; i < op_count; i++) {
-        desc = &request->transfers[i];
-        freq = sys_le32_to_cpu(desc->speed_hz);
+    tx_buf_set->buffers = tx_buf;
+    tx_buf_set->count = 0;
 
-        /* assert chip-select pin */
-        if (!selected) {
-            ret = device_spi_select(bundle->dev, request->chip_select);
-            if (ret) {
-                goto spi_err;
-            }
-            selected = true;
-        }
+    if (read_data_size > 0) {
+        rx_buf_set->buffers = rx_buf;
+        rx_buf_set->count = 0;
+        read_data = response->data;
+    } else {
+		read_data = NULL;
+		rx_buf_set = NULL;
+    }
+
+    for (i = 0; i < op_count; ++i) {
+        desc = &request->transfers[i];
 
         /* setup SPI transfer */
-        tx_buf.buf = write_data;
-        tx_buf.len = sys_le32_to_cpu(desc->len);
-        /* If rdwr without GB_SPI_XFER_READ flag, not need to pass read buffer */
-        if (desc->rdwr & GB_SPI_XFER_READ) {
-        	rx_buf.buf = read_buf;
-        	rx_buf.len = tx_buf.len;
-        	rx_bufs.buffers = &rx_buf;
-            rx_bufs.count = 1;
-        } else {
-            rx_bufs.buffers = NULL;
-            rx_bufs.count = 0;
-        }
-
-        /* set SPI configuration */
-        ret = request_to_spi_config(request, freq, desc->bits_per_word, bundle->dev, &spi_config, &spi_cs_control);
-        if (ret) {
-			goto spi_err;
-        }
-        /* In Zephyr, spi lock is on a per-call basis */
-        spi_config.operation |= SPI_LOCK_ON;
-
-        /* start SPI transfer */
-        ret = spi_transceive(bundle->dev, &spi_config, &tx_bufs, &rx_bufs);
-        if (ret) {
-            goto spi_err;
-        }
-        /* move to next gb_spi_transfer data buffer */
-        write_data += sys_le32_to_cpu(desc->len);
-
-        /* If rdwr without GB_SPI_XFER_READ flag, not need to resize
-         * read buffer
-         */
-        if (desc->rdwr & GB_SPI_XFER_READ) {
-            read_buf += sys_le32_to_cpu(desc->len);
-            rx_buf.buf = (uint8_t *)rx_buf.buf + sys_le32_to_cpu(desc->len);
-        }
-
-        if (sys_le16_to_cpu(desc->delay_usecs) > 0) {
-            usleep(sys_le16_to_cpu(desc->delay_usecs));
-        }
-
-        /* if cs_change enable, change the chip-select pin signal */
-        if (desc->cs_change) {
-            /* force deassert chip-select pin */
-            ret = device_spi_deselect(bundle->dev, request->chip_select);
-            if (ret) {
-                goto spi_err;
-            }
-            selected = false;
-        }
+        switch(desc->rdwr) {
+        case GB_SPI_XFER_WRITE:
+			tx_buf[i].buf = write_data;
+			tx_buf[i].len = sys_le32_to_cpu(desc->len);
+			write_data += tx_buf[i].len;
+			++tx_buf_set->count;
+			rx_buf[i].buf = NULL;
+			rx_buf[i].len = 0;
+			break;
+        case GB_SPI_XFER_READ:
+			tx_buf[i].buf = NULL;
+			tx_buf[i].len = 0;
+			rx_buf[i].buf = read_data;
+			rx_buf[i].len = sys_le32_to_cpu(desc->len);
+			read_data += rx_buf[i].len;
+			++rx_buf_set->count;
+			break;
+        case GB_SPI_XFER_WRITE | GB_SPI_XFER_READ:
+			tx_buf[i].buf = write_data;
+			tx_buf[i].len = sys_le32_to_cpu(desc->len);
+			write_data += tx_buf[i].len;
+			++tx_buf_set->count;
+			rx_buf[i].buf = read_data;
+			rx_buf[i].len = sys_le32_to_cpu(desc->len);
+			read_data += rx_buf[i].len;
+			++rx_buf_set->count;
+			break;
+        default:
+			LOG_ERR("invalid flags in rdwr %x", desc->rdwr);
+			errcode = GB_OP_INVALID;
+			goto freebufs;
+		}
     }
 
-spi_err:
-    errcode = ret;
-
-    if (selected) {
-        /* deassert chip-select pin */
-        ret = device_spi_deselect(bundle->dev, request->chip_select);
-        if (ret) {
-            errcode = ret;
-        }
-    }
-
-    /* unlock SPI bus*/
-    ret = device_spi_unlock(bundle->dev);
+    /* set SPI configuration */
+    ret = request_to_spi_config(request, sys_le32_to_cpu(request->transfers[0].speed_hz),
+		bits_per_word, bundle->dev, &spi_config, &spi_cs_control);
     if (ret) {
-        errcode = ret;
+		errcode = gb_errno_to_op_result(-ret);
+		goto freebufs;
     }
 
-    if (errcode) {
-        /* get error code */
-        errcode = (errcode == -EINVAL)? GB_OP_INVALID : GB_OP_UNKNOWN_ERROR;
+    /* start SPI transfer */
+    ret = spi_transceive(bundle->dev, &spi_config, tx_buf_set, rx_buf_set);
+    if (ret) {
+		errcode = gb_errno_to_op_result(-ret);
+		goto freebufs;
     }
+
+    errcode = GB_OP_SUCCESS;
+
+freebufs:
+	free(tx_buf);
+
+out:
     return errcode;
 }
 
