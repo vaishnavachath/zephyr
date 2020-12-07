@@ -113,15 +113,7 @@
 			id = <1>;
 			cport-protocol = <CPORT_PROTOCOL_GPIO>;
 		};
-	};
-	
-	gbbundle2 {
-		status = "okay";
-		compatible = "zephyr,greybus-bundle";
-		greybus-bundle;
-		id = <2>;
-		bundle-class = <BUNDLE_CLASS_BRIDGED_PHY>;		
-				
+
 		gbi2c0 {
 			status = "okay";
 			compatible = "zephyr,greybus-i2c-controller";
@@ -130,15 +122,7 @@
 			id = <2>;
 			cport-protocol = <CPORT_PROTOCOL_I2C>;
 		};
-	};
-	
-	gbbundle3 {
-		status = "okay";
-		compatible = "zephyr,greybus-bundle";
-		greybus-bundle;
-		id = <3>;
-		bundle-class = <BUNDLE_CLASS_BRIDGED_PHY>;		
-				
+
 		gbspi0 {
 			status = "okay";
 			compatible = "zephyr,greybus-spi-controller";
