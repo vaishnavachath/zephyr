@@ -49,11 +49,6 @@ static int greybus_control_init(struct device *dev) {
     return 0;
 }
 
-extern int gb_service_defer_init(struct device *, int (*init)(struct device *));
-static int defer_greybus_control_init(struct device *dev) {
-	return gb_service_defer_init(dev, &greybus_control_init);
-}
-
 #define DEFINE_GREYBUS_CONTROL(_num)										\
 																			\
 		BUILD_ASSERT(DT_PROP(DT_PARENT(DT_DRV_INST(_num)), bundle_class)	\
@@ -71,9 +66,9 @@ static int defer_greybus_control_init(struct device *dev) {
         };																	\
         																	\
         DEVICE_INIT(gpio_control_##_num, "GBCONTROL_" #_num,				\
-                            defer_greybus_control_init,						\
+                            greybus_control_init,						\
 							NULL,											\
                             &greybus_control_config_##_num, POST_KERNEL,	\
-                            CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
+                            Z_GREYBUS_CPORT_PRIORITY);
 
 DT_INST_FOREACH_STATUS_OKAY(DEFINE_GREYBUS_CONTROL);

@@ -51,12 +51,6 @@ static int greybus_interface_init(struct device *dev) {
     return 0;
 }
 
-extern int gb_service_defer_init(struct device *, int (*init)(struct device *));
-static int defer_greybus_interface_init(struct device *dev) {
-	return gb_service_defer_init(dev, &greybus_interface_init);
-}
-
-
 #define DEFINE_GREYBUS_INTERFACE(_num)						\
 															\
         static const struct greybus_interface_config		\
@@ -74,9 +68,9 @@ static int defer_greybus_interface_init(struct device *dev) {
         													\
         DEVICE_INIT(greybus_interface_##_num,				\
 			"GBINTERFACE_" #_num,							\
-			defer_greybus_interface_init,					\
+			greybus_interface_init,					\
 			NULL,											\
 			&greybus_interface_config_##_num, POST_KERNEL,	\
-			CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
+			Z_GREYBUS_INTERFACE_PRIORITY);
 
 DT_INST_FOREACH_STATUS_OKAY(DEFINE_GREYBUS_INTERFACE);

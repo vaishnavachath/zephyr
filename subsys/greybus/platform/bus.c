@@ -136,7 +136,7 @@ static const struct greybus_platform_api platform_api = {
 			"GREYBUS_" #_num,							\
 			greybus_init, &greybus_data_##_num,			\
 			&greybus_config_##_num, POST_KERNEL,		\
-			CONFIG_KERNEL_INIT_PRIORITY_DEVICE,			\
+			Z_GREYBUS_SERVICE_PRIORITY,			\
 			&platform_api);
 
 DT_INST_FOREACH_STATUS_OKAY(DEFINE_GREYBUS);
