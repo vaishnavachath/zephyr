@@ -595,8 +595,6 @@ int _gb_register_driver(unsigned int cport, int bundle_id,
 
         bundle->id = bundle_id;
         g_bundle[bundle_id] = bundle;
-    } else {
-        bundle = NULL;
     }
 
     driver->bundle = bundle;
