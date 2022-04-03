@@ -1,0 +1,28 @@
+# Copyright (c) 2022 Vaishnav Achath
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+    TI SimpleLink CC13xx / CC26xx pinctrl node.
+
+    Device pin configuration should be placed in the child nodes of this node.
+    Populate the 'pinmux' field with a pair consisting of a pin number and its IO
+    function
+
+compatible: "ti,cc13xx-cc26xx-pinctrl"
+
+include: base.yaml
+
+properties:
+    reg:
+      required: true
+
+child-binding:
+  description: |
+    This binding gives a base representation of the CC13XX/CC26XX
+    pins configuration.
+  properties:
+    pinmux:
+      required: true
+      type: array
+      description: |
+        CC13XX/CC26XX pin's configuration (IO pin, IO function, IO mode).
