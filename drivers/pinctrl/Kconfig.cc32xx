@@ -1,0 +1,9 @@
+# Copyright (c) 2022 Vaishnav Achath
+# SPDX-License-Identifier: Apache-2.0
+
+config PINCTRL_CC32XX
+	bool "TI SimpleLink CC32XX pinctrl driver"
+	default y
+	depends on DT_HAS_TI_CC32XX_PINCTRL_ENABLED
+	help
+	  Enable the TI SimpleLink CC32xx pinctrl driver
