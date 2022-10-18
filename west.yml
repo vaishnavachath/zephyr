@@ -21,6 +21,8 @@ manifest:
   remotes:
     - name: upstream
       url-base: https://github.com/zephyrproject-rtos
+    - name: vaishnavachath
+      url-base: https://github.com/vaishnavachath
 
   #
   # Please add items below based on alphabetical order
@@ -135,7 +137,8 @@ manifest:
       groups:
         - hal
     - name: hal_ti
-      revision: 000b944a788b6005d7776198e1348f5c8a657259
+      revision:  9f6d3838f311ca8328d6640f3f8b38bcc4ce2df6
+      remote: vaishnavachath
       path: modules/hal/ti
       groups:
         - hal
