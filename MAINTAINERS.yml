@@ -2055,6 +2055,7 @@ TI Platforms:
   collaborators:
     - vanti
     - cfriedt
+    - vaishnavachath
   files:
     - boards/arm/cc13*/
     - boards/arm/cc26*/
